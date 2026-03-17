@@ -1,0 +1,124 @@
+#include <Arduino.h>
+#include <Servo.h>
+
+// ===================== Pin assignments =====================
+const uint8_t STEERING_INPUT_PIN = 7;   // Receiver CH1 -> Teensy pin 7
+const uint8_t THROTTLE_INPUT_PIN = 8;   // Receiver CH2 -> Teensy pin 8
+const uint8_t ESC_OUTPUT_PIN = 5;       // ESC signal -> Teensy pin 5
+const uint8_t SERVO_OUTPUT_PIN = 6;     // Steering servo signal -> Teensy pin 6
+
+// ===================== PWM limits/settings =====================
+const int PWM_MIN_US = 1000;
+const int PWM_MAX_US = 2000;
+const int PWM_NEUTRAL_US = 1500;
+const int NEUTRAL_DEADBAND_US = 20;     // +/- around neutral
+
+// Consider signal missing if pulseIn times out
+const unsigned long SIGNAL_TIMEOUT_US = 30000; // 30 ms (~ slower than typical RC frame)
+
+// Optional smoothing: 0.0 = no update, 1.0 = no filtering
+const float THROTTLE_FILTER_ALPHA = 0.25f;
+const float STEERING_FILTER_ALPHA = 0.30f;
+
+// Debug print rate
+const unsigned long DEBUG_INTERVAL_MS = 100;
+
+Servo esc;
+Servo steeringServo;
+
+float smoothedThrottleUs = PWM_NEUTRAL_US;
+float smoothedSteeringUs = PWM_NEUTRAL_US;
+unsigned long lastDebugMs = 0;
+
+// Read one RC channel pulse width in microseconds.
+// Returns true if a valid pulse was read, false otherwise.
+bool readChannelUs(uint8_t pin, int &pulseUs) {
+  unsigned long pulse = pulseIn(pin, HIGH, SIGNAL_TIMEOUT_US);
+
+  if (pulse == 0) {
+    return false; // timed out: no signal detected
+  }
+
+  pulseUs = (int)pulse;
+  return true;
+}
+
+// Apply neutral deadband and constrain to safe PWM range.
+int sanitizePwm(int pwmUs) {
+  if (abs(pwmUs - PWM_NEUTRAL_US) <= NEUTRAL_DEADBAND_US) {
+    pwmUs = PWM_NEUTRAL_US;
+  }
+
+  return constrain(pwmUs, PWM_MIN_US, PWM_MAX_US);
+}
+
+// Simple first-order low-pass filter.
+float lowPassFilter(float previousValue, int newValue, float alpha) {
+  return previousValue + alpha * (newValue - previousValue);
+}
+
+void setup() {
+  pinMode(STEERING_INPUT_PIN, INPUT);
+  pinMode(THROTTLE_INPUT_PIN, INPUT);
+
+  esc.attach(ESC_OUTPUT_PIN);
+  steeringServo.attach(SERVO_OUTPUT_PIN);
+
+  // Start in a safe neutral state
+  esc.writeMicroseconds(PWM_NEUTRAL_US);
+  steeringServo.writeMicroseconds(PWM_NEUTRAL_US);
+
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("RC Car pass-through controller starting...");
+}
+
+void loop() {
+  int steeringInUs = PWM_NEUTRAL_US;
+  int throttleInUs = PWM_NEUTRAL_US;
+
+  bool steeringValid = readChannelUs(STEERING_INPUT_PIN, steeringInUs);
+  bool throttleValid = readChannelUs(THROTTLE_INPUT_PIN, throttleInUs);
+
+  // Failsafe behavior: if throttle signal missing, force neutral throttle.
+  if (!throttleValid) {
+    throttleInUs = PWM_NEUTRAL_US;
+  }
+
+  // If steering missing, hold center for safety.
+  if (!steeringValid) {
+    steeringInUs = PWM_NEUTRAL_US;
+  }
+
+  // Deadband + constrain
+  throttleInUs = sanitizePwm(throttleInUs);
+  steeringInUs = sanitizePwm(steeringInUs);
+
+  // Optional smoothing
+  smoothedThrottleUs = lowPassFilter(smoothedThrottleUs, throttleInUs, THROTTLE_FILTER_ALPHA);
+  smoothedSteeringUs = lowPassFilter(smoothedSteeringUs, steeringInUs, STEERING_FILTER_ALPHA);
+
+  int throttleOutUs = constrain((int)smoothedThrottleUs, PWM_MIN_US, PWM_MAX_US);
+  int steeringOutUs = constrain((int)smoothedSteeringUs, PWM_MIN_US, PWM_MAX_US);
+
+  // Pass-through outputs (with safety + smoothing)
+  esc.writeMicroseconds(throttleOutUs);
+  steeringServo.writeMicroseconds(steeringOutUs);
+
+  // Optional debug output
+  if (millis() - lastDebugMs >= DEBUG_INTERVAL_MS) {
+    lastDebugMs = millis();
+    Serial.print("IN  steer=");
+    Serial.print(steeringInUs);
+    Serial.print(" thr=");
+    Serial.print(throttleInUs);
+    Serial.print(" | OUT steer=");
+    Serial.print(steeringOutUs);
+    Serial.print(" thr=");
+    Serial.print(throttleOutUs);
+    Serial.print(" | valid S/T=");
+    Serial.print(steeringValid ? "1" : "0");
+    Serial.print("/");
+    Serial.println(throttleValid ? "1" : "0");
+  }
+}
