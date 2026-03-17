@@ -1,0 +1,161 @@
+#include <Arduino.h>
+#include <Servo.h>
+
+// =========================
+// Pin assignments
+// =========================
+const uint8_t STEERING_IN_PIN = 7;   // Receiver CH1 (steering input)
+const uint8_t THROTTLE_IN_PIN = 8;   // Receiver CH2 (throttle input)
+const uint8_t ESC_OUT_PIN     = 5;   // ESC signal output
+const uint8_t SERVO_OUT_PIN   = 6;   // Steering servo output
+
+// =========================
+// PWM and safety settings
+// =========================
+const uint16_t PWM_MIN_US      = 1000;
+const uint16_t PWM_MAX_US      = 2000;
+const uint16_t PWM_NEUTRAL_US  = 1500;
+const uint16_t DEAD_BAND_US    = 20;     // +/- deadband around neutral
+const uint32_t SIGNAL_TIMEOUT_US = 100000; // 100 ms = signal lost timeout
+
+// Optional smoothing (0.0 = none, 1.0 = very slow)
+const float SMOOTHING_ALPHA = 0.20f; // 20% new value, 80% previous
+
+// =========================
+// Input capture variables
+// =========================
+volatile uint32_t steeringRiseTimeUs = 0;
+volatile uint32_t throttleRiseTimeUs = 0;
+volatile uint16_t steeringPulseUs = PWM_NEUTRAL_US;
+volatile uint16_t throttlePulseUs = PWM_NEUTRAL_US;
+volatile uint32_t steeringLastUpdateUs = 0;
+volatile uint32_t throttleLastUpdateUs = 0;
+
+Servo esc;
+Servo steeringServo;
+
+float filteredThrottleUs = PWM_NEUTRAL_US;
+float filteredSteeringUs = PWM_NEUTRAL_US;
+
+uint32_t lastDebugPrintMs = 0;
+
+// Interrupt service routine for steering input pin
+void steeringInputISR() {
+  if (digitalReadFast(STEERING_IN_PIN)) {
+    steeringRiseTimeUs = micros();
+  } else {
+    uint32_t nowUs = micros();
+    uint32_t width = nowUs - steeringRiseTimeUs;
+    if (width >= 800 && width <= 2200) {
+      steeringPulseUs = static_cast<uint16_t>(width);
+      steeringLastUpdateUs = nowUs;
+    }
+  }
+}
+
+// Interrupt service routine for throttle input pin
+void throttleInputISR() {
+  if (digitalReadFast(THROTTLE_IN_PIN)) {
+    throttleRiseTimeUs = micros();
+  } else {
+    uint32_t nowUs = micros();
+    uint32_t width = nowUs - throttleRiseTimeUs;
+    if (width >= 800 && width <= 2200) {
+      throttlePulseUs = static_cast<uint16_t>(width);
+      throttleLastUpdateUs = nowUs;
+    }
+  }
+}
+
+// Clamp a pulse to safe servo/ESC limits
+uint16_t constrainPulse(uint16_t pulseUs) {
+  return constrain(pulseUs, PWM_MIN_US, PWM_MAX_US);
+}
+
+// Force neutral near center to reduce jitter
+uint16_t applyDeadband(uint16_t pulseUs) {
+  if (abs((int)pulseUs - (int)PWM_NEUTRAL_US) <= DEAD_BAND_US) {
+    return PWM_NEUTRAL_US;
+  }
+  return pulseUs;
+}
+
+// Simple low-pass filter for smoother outputs
+float smoothPulse(float previous, uint16_t target) {
+  return (1.0f - SMOOTHING_ALPHA) * previous + SMOOTHING_ALPHA * target;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(STEERING_IN_PIN, INPUT);
+  pinMode(THROTTLE_IN_PIN, INPUT);
+
+  // Start ESC and steering outputs at neutral/center
+  esc.attach(ESC_OUT_PIN, PWM_MIN_US, PWM_MAX_US);
+  steeringServo.attach(SERVO_OUT_PIN, PWM_MIN_US, PWM_MAX_US);
+  esc.writeMicroseconds(PWM_NEUTRAL_US);
+  steeringServo.writeMicroseconds(PWM_NEUTRAL_US);
+
+  // Use interrupts so we can measure incoming PWM accurately
+  attachInterrupt(digitalPinToInterrupt(STEERING_IN_PIN), steeringInputISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(THROTTLE_IN_PIN), throttleInputISR, CHANGE);
+
+  Serial.println("RC pass-through control started.");
+}
+
+void loop() {
+  uint16_t steeringInUs;
+  uint16_t throttleInUs;
+  uint32_t steeringUpdatedUs;
+  uint32_t throttleUpdatedUs;
+
+  // Copy volatile data atomically
+  noInterrupts();
+  steeringInUs = steeringPulseUs;
+  throttleInUs = throttlePulseUs;
+  steeringUpdatedUs = steeringLastUpdateUs;
+  throttleUpdatedUs = throttleLastUpdateUs;
+  interrupts();
+
+  uint32_t nowUs = micros();
+  bool steeringSignalOk = (nowUs - steeringUpdatedUs) < SIGNAL_TIMEOUT_US;
+  bool throttleSignalOk = (nowUs - throttleUpdatedUs) < SIGNAL_TIMEOUT_US;
+
+  // Pass-through when valid, fall back to safe values on signal loss
+  uint16_t steeringCmdUs = steeringSignalOk ? steeringInUs : PWM_NEUTRAL_US;
+  uint16_t throttleCmdUs = throttleSignalOk ? throttleInUs : PWM_NEUTRAL_US;
+
+  // Apply safety shaping
+  steeringCmdUs = constrainPulse(steeringCmdUs);
+  throttleCmdUs = constrainPulse(throttleCmdUs);
+  throttleCmdUs = applyDeadband(throttleCmdUs);
+
+  // Optional smoothing for stability
+  filteredSteeringUs = smoothPulse(filteredSteeringUs, steeringCmdUs);
+  filteredThrottleUs = smoothPulse(filteredThrottleUs, throttleCmdUs);
+
+  uint16_t steeringOutUs = constrainPulse((uint16_t)filteredSteeringUs);
+  uint16_t throttleOutUs = constrainPulse((uint16_t)filteredThrottleUs);
+
+  // Send outputs to ESC and steering servo
+  esc.writeMicroseconds(throttleOutUs);
+  steeringServo.writeMicroseconds(steeringOutUs);
+
+  // Debug prints at 10 Hz
+  if (millis() - lastDebugPrintMs >= 100) {
+    lastDebugPrintMs = millis();
+    Serial.print("IN  steer=");
+    Serial.print(steeringInUs);
+    Serial.print(" throttle=");
+    Serial.print(throttleInUs);
+    Serial.print(" | OUT steer=");
+    Serial.print(steeringOutUs);
+    Serial.print(" throttle=");
+    Serial.print(throttleOutUs);
+    Serial.print(" | SIG steer=");
+    Serial.print(steeringSignalOk ? "OK" : "LOST");
+    Serial.print(" throttle=");
+    Serial.println(throttleSignalOk ? "OK" : "LOST");
+  }
+}
